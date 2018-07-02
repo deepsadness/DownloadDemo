@@ -81,7 +81,45 @@ final class Segment {
         next = segment;
         return segment;
     }
+    /**
+     * Returns a new segment that shares the underlying byte array with this. Adjusting pos and limit
+     * are safe but writes are forbidden. This also marks the current segment as shared, which
+     * prevents it from being pooled.
+     */
+//    Segment sharedCopy() {
+//        shared = true;
+//        return new Segment(data, pos, limit, true, false);
+//    }
 
+    /**
+     * 将head的segment分成两个。按照给的byteCount作为分割点
+     * Splits this head of a circularly-linked list into two segments. The first
+     * segment contains the data in {@code [pos..pos+byteCount)}. The second
+     * segment contains the data in {@code [pos+byteCount..limit)}. This can be
+     * useful when moving partial segments from one buffer to another.
+     *
+     * <p>Returns the new head of the circularly-linked list.
+     */
+    public Segment split(int byteCount){
+        if (byteCount <= 0 || byteCount > limit - pos) throw new IllegalArgumentException();
+        Segment prefix;
+        // We have two competing performance goals:
+        //  - Avoid copying data. We accomplish this by sharing segments.
+        //  - Avoid short shared segments. These are bad for performance because they are readonly and
+        //    may lead to long chains of short segments.
+        // To balance these goals we only share segments when the copy will be large.
+//        if (byteCount >= SHARE_MINIMUM) {
+//            prefix = sharedCopy();
+//        } else {
+            prefix = SegmentPool.take();
+            System.arraycopy(data, pos, prefix.data, 0, byteCount);
+//        }
+
+        prefix.limit = prefix.pos + byteCount;
+        pos += byteCount;
+        prev.push(prefix);
+        return prefix;
+    }
     /**
      * 在当前segment和它的前驱都小于50%时，调用，会进行合并。并回收当前的segment
      */

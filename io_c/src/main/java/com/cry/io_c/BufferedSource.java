@@ -20,4 +20,7 @@ public interface BufferedSource extends Source,ReadableByteChannel {
      * 如果这个source没有更多的bytes时。返回true.直到还有bytes来读取。或者完全没有了。
      */
     boolean exhausted() throws IOException;
+
+    void skip(long byteCount) throws IOException;
+
 }

@@ -3,6 +3,7 @@ package com.cry.io_c;
 import com.sun.istack.internal.Nullable;
 
 import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ByteChannel;
@@ -32,6 +33,11 @@ public final class Buffer implements BufferedSource, BufferedSink, Closeable, By
     }
 
     @Override
+    public BufferedSink emitCompleteSegments() throws IOException {
+        return this; // Nowhere to emit to!
+    }
+
+    @Override
     public boolean exhausted() throws IOException {
         return size == 0;
     }
@@ -45,7 +51,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Closeable, By
         //如果读取的部分大于当前的size,则将其等于size
         if (byteCount > size) byteCount = size;
         //读取时，直接调用sink，写进去。这里的读取，其实主要是做限制大小的作用的？
-        sink.write(this,byteCount);
+        sink.write(this, byteCount);
         return byteCount;
     }
 
@@ -98,10 +104,46 @@ public final class Buffer implements BufferedSource, BufferedSink, Closeable, By
         if (source == this) throw new IllegalArgumentException("source == this");
 //        checkOffsetAndCount(source.size,0,byteCount);
 //
-//        while (byteCount>0){
-//
-//            if (byteCount<(source.head.limit-source.head.pos))
-//        }
+        while (byteCount > 0) {
+            //都是从head开始读
+            //是否需要移动header?.
+            //表示还取得出
+            if (byteCount < (source.head.limit - source.head.pos)) {
+                //取出head的prev就是尾部的segment
+                Segment tail = head != null ? head.prev : null;
+                if (tail != null && (byteCount + tail.limit - tail.pos <= Segment.SIZE)) {
+                    //如果tail还有容量。
+                    //就将source的head往当前的tail中写入
+                    source.head.writeTo(tail, (int) byteCount);
+                    //写入后，当前的大小变大，而source的变小
+                    source.size -= byteCount;
+                    size += byteCount;
+                    return;
+                } else {
+                    //如果tail的容量不够，或者没有tail,则将head分成两个部分。
+                    source.head = source.head.split((int) byteCount);
+                }
+            }
+
+            //如果进行了切分，就需要重新分配
+            Segment segmentToMove = source.head;
+            long movedByteCount = segmentToMove.limit - segmentToMove.pos;
+            //先将自己从原来的关系中清除
+            source.head = segmentToMove.pop();
+            //判断当前的情况
+            if (head == null) {
+                head = segmentToMove;
+                head.next = head.prev = head;
+            } else {
+                //如果已经有了，就添加到最后去。
+                Segment tail = head.prev;
+                tail = tail.push(segmentToMove);
+                tail.compact();
+            }
+            source.size -= movedByteCount;
+            size += movedByteCount;
+            byteCount -= movedByteCount;
+        }
     }
 
     @Override
@@ -127,11 +169,113 @@ public final class Buffer implements BufferedSource, BufferedSink, Closeable, By
 
     @Override
     public int read(ByteBuffer sink) throws IOException {
-        return 0;
+        //读取的话，就是读取head
+        Segment s = head;
+        if (s == null) return -1;
+
+        int toCopy = Math.min(sink.remaining(), s.limit - s.pos);
+        sink.put(s.data, s.pos, toCopy);
+
+        s.pos += toCopy;
+        size -= toCopy;
+
+        //如果读取结束。就将head回收
+        if (s.pos == s.limit) {
+            head = s.pop();
+            SegmentPool.recycle(s);
+        }
+
+        return toCopy;
     }
 
     @Override
     public int write(ByteBuffer source) throws IOException {
-        return 0;
+        if (source == null) throw new IllegalArgumentException("source == null");
+
+        int byteCount = source.remaining();
+        int remaining = byteCount;
+        //不断通过segment进行复制bytes
+        while (remaining > 0) {
+            Segment tail = writableSegment(1);
+            //获取需要copy的真实大小
+            int toCopy = Math.min(remaining, Segment.SIZE - tail.limit);
+            source.get(tail.data, tail.limit, toCopy);
+
+            remaining -= toCopy;
+            tail.limit += toCopy;
+        }
+
+        size += byteCount;
+        return byteCount;
     }
+
+
+    /**
+     * Returns a tail segment that we can write at least {@code minimumCapacity}
+     * bytes to, creating it if necessary.
+     */
+    Segment writableSegment(int minimumCapacity) {
+        if (minimumCapacity < 1 || minimumCapacity > Segment.SIZE) throw new IllegalArgumentException();
+
+        if (head == null) {
+            head = SegmentPool.take(); // Acquire a first segment.
+            return head.next = head.prev = head;
+        }
+        //取出尾部的。如果已经满了的话，就在构造一个
+        Segment tail = head.prev;
+//        if (tail.limit + minimumCapacity > Segment.SIZE || !tail.owner) {
+        if (tail.limit + minimumCapacity > Segment.SIZE ) {
+            tail = tail.push(SegmentPool.take()); // Append a new empty segment to fill up.
+        }
+        return tail;
+    }
+
+    /**
+     * 返回可以直接写出的segment.这个大小不包括尾部，被写入的部分
+     * Returns the number of bytes in segments that are not writable. This is the
+     * number of bytes that can be flushed immediately to an underlying sink
+     * without harming throughput.
+     */
+    public long completeSegmentByteCount() {
+        long result = size;
+        if (result == 0) return 0;
+
+        // Omit the tail if it's still writable.
+        Segment tail = head.prev;
+        if (tail.limit < Segment.SIZE) {
+            result -= tail.limit - tail.pos;
+        }
+
+        return result;
+    }
+
+    /**
+     * Discards all bytes in this buffer. Calling this method when you're done
+     * with a buffer will return its segments to the pool.
+     */
+    public void clear() {
+        try {
+            skip(size);
+        } catch (EOFException e) {
+            throw new AssertionError(e);
+        }
+    }
+    /** Discards {@code byteCount} bytes from the head of this buffer. */
+    @Override public void skip(long byteCount) throws EOFException {
+        while (byteCount > 0) {
+            if (head == null) throw new EOFException();
+
+            int toSkip = (int) Math.min(byteCount, head.limit - head.pos);
+            size -= toSkip;
+            byteCount -= toSkip;
+            head.pos += toSkip;
+
+            if (head.pos == head.limit) {
+                Segment toRecycle = head;
+                head = toRecycle.pop();
+                SegmentPool.recycle(toRecycle);
+            }
+        }
+    }
+
 }
